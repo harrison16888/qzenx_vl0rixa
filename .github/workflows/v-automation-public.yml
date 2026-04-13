@@ -4,27 +4,6 @@ on:
   schedule:
     - cron: '0 */6 * * *'
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Dry run — generate posts but do NOT submit'
-        required: false
-        default: false
-        type: boolean
-      manual_login:
-        description: 'Wait for manual login (tmate)'
-        required: false
-        default: false
-        type: boolean
-      debug_mode:
-        description: 'Enable VNC for monitoring'
-        required: false
-        default: false
-        type: boolean
-      upload_ollama_model:
-        description: 'Pull Ollama model and upload to Google Drive (one-time setup)'
-        required: false
-        default: false
-        type: boolean
 
 jobs:
   run-x-post:
