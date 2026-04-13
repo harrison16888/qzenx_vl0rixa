@@ -1,21 +1,51 @@
-name: V-Automation
+name: Post-Public-Automation
 
 on:
+  schedule:
+    - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
-      project:
-        description: 'Specific project folder or date'
+      dry_run:
+        description: 'Dry run — generate posts but do NOT submit'
         required: false
-        type: string
+        default: false
+        type: boolean
+      manual_login:
+        description: 'Wait for manual login (tmate)'
+        required: false
+        default: false
+        type: boolean
+      debug_mode:
+        description: 'Enable VNC for monitoring'
+        required: false
+        default: false
+        type: boolean
+      upload_ollama_model:
+        description: 'Pull Ollama model and upload to Google Drive (one-time setup)'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
-  run-v-process:
+  run-x-post:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     env:
+      TZ: 'America/Los_Angeles'
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-      
+      # --- LLM Source 1: Antigravity Manager (primary) ---
+      API_KEY: ${{ secrets.ANTIGRAVITY_API_KEY }}
+      API_BASE_URL: http://127.0.0.1:8045/v1
+      # --- LLM Source 2: GitHub Models (cloud fallback) ---
+      GH_MODELS_TOKEN: ${{ secrets.GH_MODELS_TOKEN }}
+      GH_MODELS_BASE_URL: https://models.inference.ai.azure.com
+      GH_MODEL: gpt-4o
+      # --- LLM Source 3: Ollama (local last resort) ---
+      OLLAMA_BASE_URL: http://127.0.0.1:11434/v1
+      OLLAMA_MODEL: llama3.2:3b
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,128 +59,386 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb python3-tk python3-dev scrot gnome-screenshot x11vnc novnc websockify xclip xsel
-          sudo apt-get install -y tesseract-ocr libtesseract-dev openssh-server libgbm1 ffmpeg
-          xclip -version || true
-          xsel --version || true
-          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
-          sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list'
-          sudo apt-get update
-          sudo apt-get install -y google-chrome-stable
-          
-      - name: Cache Python virtual environment
-        uses: actions/cache@v4
-        id: cache-venv
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
-          path: .venv
-          key: ${{ runner.os }}-venv-v-process
-          
+          node-version: '20'
+
       - name: Install Python dependencies
-        if: steps.cache-venv.outputs.cache-hit != 'true'
         run: |
           python -m venv .venv
-          source .venv/bin/activate
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          echo "$(pwd)/.venv/bin" >> $GITHUB_PATH
-          echo "PYTHONPATH=$(pwd)" >> $GITHUB_ENV
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r requirements.txt
+          .venv/bin/python -m pip install google-api-python-client google-auth-oauthlib selenium openai
 
-      - name: Activate Virtual Environment
-        run: |
-          echo "$(pwd)/.venv/bin" >> $GITHUB_PATH
-          
+      # -------------------------------------------------------
+      # CACHE RESTORES
+      # -------------------------------------------------------
+
+      - name: Restore Antigravity Data Session
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.antigravity_tools
+          key: antigravity-data-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            antigravity-data-${{ runner.os }}-
+
       - name: Create session directories
-        run: |
-          mkdir -p .browser-session
-          
+        run: mkdir -p ~/.browser-session
+
       - name: Restore browser session
         uses: actions/cache/restore@v4
         with:
-          path: .browser-session
+          path: ~/.browser-session
           key: v-browser-session-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
             v-browser-session-${{ runner.os }}-
 
       - name: Clear stale browser locks
         run: |
-          rm -f .browser-session/SingletonLock
-          rm -f .browser-session/SingletonCookie
-          find .browser-session -name "lockfile" -delete || true
-            
+          rm -f ~/.browser-session/SingletonLock
+          rm -f ~/.browser-session/SingletonCookie
+          find ~/.browser-session -name "lockfile" -delete || true
+
+      # -------------------------------------------------------
+      # SYSTEM DEPENDENCIES
+      # -------------------------------------------------------
+
+      - name: Write X session
+        run: echo '${{ secrets.X_SESSION_JSON }}' > /tmp/x_session.json
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgbm1 ffmpeg
+          sudo apt-get install -y python3-tk python3-dev scrot gnome-screenshot x11vnc novnc websockify xclip xsel
+          sudo apt-get install -y tesseract-ocr libtesseract-dev openssh-server fluxbox wmctrl
+          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list'
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+
+      # -------------------------------------------------------
+      # LLM SOURCE 1: ANTIGRAVITY MANAGER (PRIMARY)
+      # -------------------------------------------------------
+
+      - name: Cache Antigravity Docker Image
+        uses: actions/cache@v4
+        id: cache-antigravity
+        with:
+          path: /tmp/antigravity-image.tar
+          key: antigravity-docker-v1
+
+      - name: Download & Save Docker Image
+        if: steps.cache-antigravity.outputs.cache-hit != 'true'
+        run: |
+          docker pull lbjlaq/antigravity-manager:latest
+          docker save lbjlaq/antigravity-manager:latest -o /tmp/antigravity-image.tar
+
+      - name: Load Cached Docker Image
+        if: steps.cache-antigravity.outputs.cache-hit == 'true'
+        run: docker load -i /tmp/antigravity-image.tar
+
+      - name: Start Antigravity Manager via Docker
+        run: |
+          docker run -d --name antigravity-manager \
+            --restart always \
+            -p 8045:8045 \
+            -e API_KEY="${{ secrets.ANTIGRAVITY_API_KEY }}" \
+            -e NO_CACHE=true \
+            -v ~/.antigravity_tools:/root/.antigravity_tools \
+            -v ~/.browser-session:/root/.browser-session \
+            lbjlaq/antigravity-manager:latest
+
+      - name: Wait for Antigravity Manager to initialize
+        run: |
+          sleep 10
+          curl -f http://127.0.0.1:8045/v1/models || echo "API still starting, proceeding..."
+          sleep 10
+
+      # -------------------------------------------------------
+      # LLM SOURCE 2: GITHUB MODELS (CLOUD FALLBACK)
+      # -------------------------------------------------------
+
+      - name: Verify GitHub Models API
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.GH_MODELS_TOKEN }}" \
+            https://models.inference.ai.azure.com/models)
+          if [ "$RESPONSE" = "200" ]; then
+            echo "GH_MODELS_AVAILABLE=true" >> $GITHUB_ENV
+          else
+            echo "GH_MODELS_AVAILABLE=false" >> $GITHUB_ENV
+          fi
+
+      # -------------------------------------------------------
+      # LLM SOURCE 3: OLLAMA (LOCAL LAST RESORT)
+      # -------------------------------------------------------
+
+      - name: Free up disk space for Ollama
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/lib/android
+          docker image prune -f || true
+
+      - name: Install and Start Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          mkdir -p logs
+          OLLAMA_HOST=0.0.0.0 ollama serve > logs/ollama_server.log 2>&1 &
+          sleep 5
+
+      - name: Cache Ollama model
+        uses: actions/cache@v4
+        id: cache-ollama-model
+        with:
+          path: ~/.ollama/models
+          key: ollama-llama3.2-3b-v1
+
       - name: Create Google Credentials
         run: |
           if [ -n "${{ secrets.GOOGLE_DRIVE_CREDENTIALS }}" ]; then
             echo "${{ secrets.GOOGLE_DRIVE_CREDENTIALS }}" > credentials.json
           fi
           if [ -n "${{ secrets.GOOGLE_DRIVE_TOKEN }}" ]; then
-            echo "${{ secrets.GOOGLE_DRIVE_TOKEN }}" | base64 --decode > token.pickle
+            echo "${{ secrets.GOOGLE_DRIVE_TOKEN }}" > token.json
+            mkdir -p ~/.api_tools
+            echo "${{ secrets.GOOGLE_DRIVE_TOKEN }}" > ~/.api_tools/token.json
           fi
+
+      - name: Restore Ollama model from Google Drive (if cache miss)
+        if: steps.cache-ollama-model.outputs.cache-hit != 'true'
+        run: |
+          if [ -f "ollama_model_drive_id.txt" ]; then
+            .venv/bin/python - <<'EOF'
+          from googleapiclient.discovery import build
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.http import MediaIoBaseDownload
+          import os
+
+          token_file = 'token.json'
+          if not os.path.exists(token_file):
+              exit(0)
+
+          model_id = open('ollama_model_drive_id.txt').read().strip()
+          creds = Credentials.from_authorized_user_file(token_file)
+          service = build('drive', 'v3', credentials=creds)
+
+          request = service.files().get_media(fileId=model_id)
+          with open('/tmp/ollama-llama3.2-3b.tar.gz', 'wb') as f:
+              downloader = MediaIoBaseDownload(f, request)
+              done = False
+              while not done:
+                  status, done = downloader.next_chunk()
+          EOF
+            mkdir -p ~/.ollama/models
+            tar -xzf /tmp/ollama-llama3.2-3b.tar.gz -C ~/.ollama/models
+          fi
+
+      - name: Pull Ollama model (if not cached or restored)
+        if: steps.cache-ollama-model.outputs.cache-hit != 'true'
+        run: |
+          if [ ! -d ~/.ollama/models/manifests ]; then
+            ollama pull llama3.2:3b
+          fi
+
+      - name: Upload Ollama model to Google Drive (one-time setup)
+        if: ${{ github.event.inputs.upload_ollama_model == 'true' }}
+        run: |
+          ollama list
+
+      - name: Verify Ollama model ready
+        run: |
+          ollama list
+          echo "OLLAMA_AVAILABLE=true" >> $GITHUB_ENV
+
+      # -------------------------------------------------------
+      # DISPLAY + CREDENTIALS
+      # -------------------------------------------------------
 
       - name: Setup Virtual Display
         run: |
           set +e
           touch ~/.Xauthority
-          Xvfb :99 -screen 0 2650x1550x24 &
+          Xvfb :99 -screen 0 1920x1080x24 &
           echo "DISPLAY=:99" >> $GITHUB_ENV
           echo "XAUTHORITY=$HOME/.Xauthority" >> $GITHUB_ENV
           sleep 5
-          xdpyinfo -display :99 > /dev/null 2>&1 || echo "⚠️ Xvfb reported issues"
 
-      - name: Run V-Process (Persistent Auto-Run Mode)
+      - name: Create X Session
+        run: |
+          echo "{
+            \"auth_token\": \"${{ secrets.X_AUTH_TOKEN }}\",
+            \"ct0\": \"${{ secrets.X_CSRF_TOKEN }}\",
+            \"username\": \"${{ secrets.X_USERNAME }}\"
+          }" > /tmp/x_session.json
+
+      # -------------------------------------------------------
+      # DEBUG / MANUAL LOGIN MODE
+      # -------------------------------------------------------
+
+      - name: Start Manual Login Session (Debug Mode)
+        if: ${{ github.event.inputs.manual_login == 'true' || github.event.inputs.debug_mode == 'true' }}
         env:
-          V_URL: ${{ secrets.V_URL }}
+          V_URL: https://x.com/home
         run: |
           set +e
-          source .venv/bin/activate
-          export DISPLAY=:99
+          sudo service ssh restart
+          echo "runner:runner" | sudo chpasswd
+
+          fluxbox -display :99 &
+          x11vnc -display :99 -forever -shared -bg -nopw
+          websockify --web /usr/share/novnc 6080 localhost:5900 &
+
           mkdir -p logs
-          
-          # Start Control Panel in background so it's available via VNC if needed
-          .venv/bin/python v_lib/v_process/controls.py > /dev/null 2>&1 &
-          
-          google-chrome --no-sandbox --disable-dev-shm-usage --disable-gpu --remote-debugging-port=9222 --disable-session-crashed-bubble --no-first-run --no-default-browser-check --disable-infobars --window-size=2000,1550 --window-position=0,0 --user-data-dir="$(pwd)/.browser-session" "${V_URL:-https://example.com/}" 2>&1 | sed -u -E 's/https?:\/\/[^[:space:]]+/<URL_REMOVED>/g' > logs/chrome_startup.log &
-          sleep 12
-          
-          PROJECT_NAME="${{ github.event.inputs.project }}"
-          if [ -n "$PROJECT_NAME" ]; then
-            echo "🎯 Targeted Project: $PROJECT_NAME (Looping enabled)"
-            .venv/bin/python v_lib/v_process/runner.py --project "$PROJECT_NAME" --loop 2>&1 | sed -u -E 's/https?:\/\/[^[:space:]]+/<URL_REMOVED>/g' | tee -a logs/v_process.log || echo "⚠️ Automation failed"
-          else
-            echo "🔍 Auto-discovery Mode (Looping enabled)..."
-            .venv/bin/python v_lib/v_process/runner.py --loop 2>&1 | sed -u -E 's/https?:\/\/[^[:space:]]+/<URL_REMOVED>/g' | tee -a logs/v_process.log || echo "⚠️ Automation failed"
+          .venv/bin/python v_lib/v_process/controls.py > logs/controls_tk.log 2>&1 &
+          .venv/bin/python scripts/web_controls.py > logs/web_controls.log 2>&1 &
+
+          google-chrome \
+            --no-sandbox \
+            --disable-dev-shm-usage \
+            --disable-gpu \
+            --remote-debugging-port=9222 \
+            --disable-session-crashed-bubble \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-infobars \
+            --window-size=1300,1080 \
+            --window-position=0,0 \
+            --user-data-dir="$HOME/.browser-session" \
+            "${V_URL}" > logs/chrome_startup.log 2>&1 &
+
+          sudo apt-get install -y tmate
+          tmate -S /tmp/tmate.sock new-session -d
+          tmate -S /tmp/tmate.sock wait tmate-ready
+
+          if [ "${{ github.event.inputs.manual_login }}" = "false" ]; then
+            touch /tmp/run_x_post
           fi
 
-      - name: Upload Results to Google Drive
-        if: always()
-        run: |
-          set +e
-          for dir in $(find . -type d -name "7.downloads"); do
-            count=$(ls -1 "$dir"/*.mp4 2>/dev/null | wc -l || echo 0)
-            if [ $count -gt 0 ]; then
-               parent_name="V_Results_$(date +%Y%m%d)"
-               .venv/bin/python v_lib/v_process/upload_results.py "$dir" --parent-name "$parent_name" > /dev/null 2>&1 || echo "⚠️ Upload failed for $dir"
+          # Main Event Loop
+          while true; do
+            if [ -f /tmp/save ]; then
+              break
             fi
+
+            if [ -f /tmp/run_x_post ]; then
+              rm /tmp/run_x_post
+              DRY_RUN_ARG=""
+              if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+                DRY_RUN_ARG="--dry-run"
+              fi
+              .venv/bin/python scripts/post_to_x.py $DRY_RUN_ARG 2>&1 | tee -a logs/x_post.log || true
+            fi
+
+            if [ -f /tmp/run_x_actions ]; then
+              rm /tmp/run_x_actions
+              .venv/bin/python scripts/x_actions.py 2>&1 | tee -a logs/x_actions.log || true
+            fi
+
+            if [ -f /tmp/load_chrome ]; then
+              pkill google-chrome || true
+              google-chrome \
+                --no-sandbox \
+                --disable-dev-shm-usage \
+                --disable-gpu \
+                --remote-debugging-port=9222 \
+                --disable-session-crashed-bubble \
+                --no-first-run \
+                --no-default-browser-check \
+                --disable-infobars \
+                --window-size=1280,960 \
+                --window-position=0,0 \
+                --user-data-dir="$HOME/.browser-session" \
+                "https://x.com/home" > logs/chrome_startup.log 2>&1 &
+              rm /tmp/load_chrome
+            fi
+
+            sleep 2
           done
+
+      # -------------------------------------------------------
+      # NORMAL RUN
+      # -------------------------------------------------------
+
+      - name: Run X-Post
+        if: ${{ github.event.inputs.manual_login != 'true' && github.event.inputs.debug_mode != 'true' }}
+        env:
+          V_URL: https://x.com/home
+        run: |
+          mkdir -p logs
+          sleep 3
+
+          google-chrome \
+            --no-sandbox \
+            --disable-dev-shm-usage \
+            --disable-gpu \
+            --remote-debugging-port=9222 \
+            --disable-session-crashed-bubble \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-infobars \
+            --window-size=1320,1080 \
+            --window-position=0,0 \
+            --user-data-dir="$HOME/.browser-session" \
+            "${V_URL}" > logs/chrome_startup.log 2>&1 &
+          sleep 12
+
+          DRY_RUN_ARG=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            DRY_RUN_ARG="--dry-run"
+          fi
+
+          .venv/bin/python scripts/post_to_x.py $DRY_RUN_ARG
+
+      # -------------------------------------------------------
+      # SAVE STATE
+      # -------------------------------------------------------
 
       - name: Commit and Push State Changes
         if: always()
         run: |
-          set +e
-          git add v_lib/v_process/automation_state.json v_lib/v_process/ui_config.json
-          git commit -m "Update state [skip ci]" > /dev/null || echo "No changes"
-          git push origin HEAD > /dev/null 2>&1 || true
-          git remote add harrison https://${{ secrets.HARRISON_TOKEN }}@github.com/harrison16888/xqplovrmat_zeniqpl.git > /dev/null 2>&1 || true
-          git push harrison HEAD > /dev/null 2>&1 || true
+          git add posted-ids.json
+          git commit -m "Update posted IDs [skip ci]" || echo "No changes to commit"
+          git push origin HEAD
+
+      - name: Save Antigravity Data Session
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.antigravity_tools
+          key: antigravity-data-${{ runner.os }}-${{ github.run_id }}
+
+      - name: Stop Chrome before saving session
+        if: always()
+        run: |
+          pkill -f google-chrome || true
+          sleep 3
+          rm -f ~/.browser-session/SingletonLock
+          rm -f ~/.browser-session/SingletonCookie
+          find ~/.browser-session -name "lockfile" -delete || true
+          mkdir -p ~/.browser-session
 
       - name: Save browser session
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: .browser-session
+          path: |
+            ~/.browser-session
+            !~/.browser-session/Default/Cache
+            !~/.browser-session/Default/Code Cache
+            !~/.browser-session/Default/GPUCache
           key: v-browser-session-${{ runner.os }}-${{ github.run_id }}
-          
 
+      - name: Ensure Ollama model directory exists
+        if: always()
+        run: mkdir -p ~/.ollama/models
+
+      - name: Save Ollama model cache
+        if: always() && steps.cache-ollama-model.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-llama3.2-3b-v1
