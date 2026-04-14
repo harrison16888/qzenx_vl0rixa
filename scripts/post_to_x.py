@@ -66,7 +66,7 @@ SESSION_FILE    = Path("/tmp/x_session.json")
 POSTED_IDS_FILE = Path("posted-ids.json")
 BROWSER_SESSION = str(Path(os.getcwd()) / ".browser-session")
 
-MAX_POSTS_PER_RUN = 6
+MAX_POSTS_PER_RUN = 1
 LOOKBACK_DAYS = 7
 
 
@@ -667,17 +667,11 @@ def main():
             
             if success:
                 posts_done += 1
-                if posts_done < MAX_POSTS_PER_RUN:
-                    print("⏳ Waiting 10 minutes (600s) before next post...")
-                    time.sleep(600 if not IS_DRY_RUN else 5)
-                    
-                    # Recreate Google Drive service to prevent stale connection errors
-                    if service:
-                        try:
-                            service.close()
-                        except AttributeError:
-                            pass
-                        service = get_drive_service()
+                # Exit immediately after one post per USER request "don't wait. just exit"
+                break
+        
+        if posts_done >= MAX_POSTS_PER_RUN:
+            break
                 
     if posts_done == 0:
         print("✅ No unposted projects found in the lookback period.")
